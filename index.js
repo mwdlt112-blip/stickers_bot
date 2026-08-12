@@ -22,7 +22,6 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // 2. 用户数据持久化文件路径
 const USERS_FILE = path.join(__dirname, 'users.json');
 
-// 读取已记录的用户集合
 function getUsers() {
     try {
         if (fs.existsSync(USERS_FILE)) {
@@ -35,7 +34,6 @@ function getUsers() {
     return new Set();
 }
 
-// 保存新用户 ID
 function recordUser(userId) {
     const users = getUsers();
     if (!users.has(userId)) {
@@ -48,7 +46,6 @@ function recordUser(userId) {
     }
 }
 
-// 记录所有互动的用户
 bot.use((ctx, next) => {
     if (ctx.from && ctx.from.id) {
         recordUser(ctx.from.id);
@@ -56,143 +53,173 @@ bot.use((ctx, next) => {
     return next();
 });
 
-// 3. 指令：查看机器人用户数量统计
+// 查看累计用户统计
 bot.command('stats', async (ctx) => {
     const users = getUsers();
     ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${users.size} 人`);
 });
 
-// 4. 贴纸克隆主逻辑
+// 单个贴纸包克隆的核心逻辑函数
+async function processSingleClone(ctx, title, packUrl, taskIndex = 1, totalTasks = 1) {
+    const match = packUrl.match(/(?:addstickers|addemoji)\/([a-zA-Z0-9_]+)/);
+    if (!match) {
+        return ctx.reply(`❌ 任务 [${taskIndex}/${totalTasks}] 无法识别贴纸链接：${packUrl}`);
+    }
+
+    const originPackName = match[1];
+    const prefix = totalTasks > 1 ? `[任务 ${taskIndex}/${totalTasks}] ` : '';
+
+    // 初始化进度面板
+    const progressMsg = await ctx.reply(
+        `⏳ ${prefix}正在准备克隆表情包...\n` +
+        `📌 标题：【${title}】\n` +
+        `🔢 克隆进度：【正在获取表情包信息...】`
+    );
+
+    try {
+        const originPack = await ctx.telegram.getStickerSet(originPackName);
+        const totalCount = originPack.stickers.length;
+
+        const botInfo = await ctx.telegram.getMe();
+        const randomStr = Math.random().toString(36).substring(2, 10);
+        const newPackName = 'pack_' + randomStr + '_by_' + botInfo.username;
+        const userId = ctx.from.id;
+
+        const firstItem = originPack.stickers[0];
+        const firstFormat = firstItem.is_animated ? 'animated' : (firstItem.is_video ? 'video' : 'static');
+        
+        const firstStickerObj = {
+            sticker: firstItem.file_id,
+            format: firstFormat,
+            emoji_list: [firstItem.emoji || '👍']
+        };
+
+        const createUrl = `https://api.telegram.org/bot${TOKEN}/createNewStickerSet`;
+        const createRes = await axios.post(createUrl, {
+            user_id: userId,
+            name: newPackName,
+            title: title,
+            stickers: [firstStickerObj],
+            sticker_type: originPack.sticker_type === 'custom_emoji' ? 'custom_emoji' : 'regular'
+        });
+
+        if (!createRes.data.ok) {
+            throw new Error(createRes.data.description || '创建贴纸包失败');
+        }
+
+        // 更新进度：已添加第 1 个
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            progressMsg.message_id,
+            null,
+            `⏳ ${prefix}正在克隆表情包：\n` +
+            `📌 标题：【${title}】\n` +
+            `🔢 克隆进度：【已添加第 1/${totalCount} 个贴纸】`
+        );
+
+        const addUrl = `https://api.telegram.org/bot${TOKEN}/addStickerToSet`;
+        let lastUpdate = Date.now();
+
+        for (let i = 1; i < totalCount; i++) {
+            const item = originPack.stickers[i];
+            const itemFormat = item.is_animated ? 'animated' : (item.is_video ? 'video' : 'static');
+            
+            const stickerObj = {
+                sticker: item.file_id,
+                format: itemFormat,
+                emoji_list: [item.emoji || '👍']
+            };
+
+            try {
+                await axios.post(addUrl, {
+                    user_id: userId,
+                    name: newPackName,
+                    sticker: stickerObj
+                });
+            } catch (addErr) {
+                console.error(`追加贴纸 ${i} 失败:`, addErr.response?.data?.description || addErr.message);
+            }
+
+            const currentCount = i + 1;
+            // 控制刷新频率（每 5 个贴纸或间隔 1.5 秒更新一次进度，防止 API 限流）
+            if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 1500) {
+                try {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        progressMsg.message_id,
+                        null,
+                        `⏳ ${prefix}正在克隆表情包：\n` +
+                        `📌 标题：【${title}】\n` +
+                        `🔢 克隆进度：【已添加第 ${currentCount}/${totalCount} 个贴纸】`
+                    );
+                    lastUpdate = Date.now();
+                } catch (e) {}
+            }
+
+            await sleep(100);
+        }
+
+        const finalLink = 'https://t.me/addstickers/' + newPackName;
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            progressMsg.message_id,
+            null,
+            `✅ ${prefix}表情包克隆完成！\n\n` +
+            `📌 标题：【${title}】\n` +
+            `🔢 总计：共 ${totalCount} 个贴纸\n` +
+            `🔗 链接：\n${finalLink}`
+        );
+
+    } catch (err) {
+        console.error('克隆失败:', err.response?.data || err.message);
+        const errMsg = err.response?.data?.description || err.message || '未知错误';
+        try {
+            await ctx.telegram.editMessageText(
+                ctx.chat.id,
+                progressMsg.message_id,
+                null,
+                `❌ ${prefix}克隆失败：${errMsg}`
+            );
+        } catch (e) {
+            ctx.reply(`❌ ${prefix}克隆失败：${errMsg}`);
+        }
+    }
+}
+
+// 监听消息并支持批量解析
 bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
 
-    if (text.startsWith('克隆#')) {
-        const parts = text.split('#');
-        if (parts.length < 3) {
-            return ctx.reply('❌ 格式不正确！正确格式为：\n克隆#自定义标题#贴纸链接');
+    const lines = text.split('\n');
+    const tasks = [];
+
+    for (let line of lines) {
+        line = line.trim();
+        if (!line) continue;
+
+        if (line.startsWith('克隆#')) {
+            line = line.replace('克隆#', '');
         }
 
-        const title = parts[1];
-        const packUrl = parts[2];
-
-        const match = packUrl.match(/(?:addstickers|addemoji)\/([a-zA-Z0-9_]+)/);
-        if (!match) {
-            return ctx.reply('❌ 无法识别的贴纸链接，请检查格式！');
-        }
-
-        const originPackName = match[1];
-
-        const progressMsg = await ctx.reply(
-            '⏳ 已收到请求，正在准备处理...\n' +
-            '📌 新标题：' + title + '\n' +
-            '📦 原包短名：' + originPackName
-        );
-
-        try {
-            const originPack = await ctx.telegram.getStickerSet(originPackName);
-            const totalCount = originPack.stickers.length;
-
-            const botInfo = await ctx.telegram.getMe();
-            const randomStr = Math.random().toString(36).substring(2, 10);
-            const newPackName = 'pack_' + randomStr + '_by_' + botInfo.username;
-            const userId = ctx.from.id;
-
-            const firstItem = originPack.stickers[0];
-            const firstFormat = firstItem.is_animated ? 'animated' : (firstItem.is_video ? 'video' : 'static');
-            
-            const firstStickerObj = {
-                sticker: firstItem.file_id,
-                format: firstFormat,
-                emoji_list: [firstItem.emoji || '👍']
-            };
-
-            const createUrl = `https://api.telegram.org/bot${TOKEN}/createNewStickerSet`;
-            const createRes = await axios.post(createUrl, {
-                user_id: userId,
-                name: newPackName,
-                title: title,
-                stickers: [firstStickerObj],
-                sticker_type: originPack.sticker_type === 'custom_emoji' ? 'custom_emoji' : 'regular'
-            });
-
-            if (!createRes.data.ok) {
-                throw new Error(createRes.data.description || '创建贴纸包失败');
-            }
-
-            await ctx.telegram.editMessageText(
-                ctx.chat.id,
-                progressMsg.message_id,
-                null,
-                `⏳ 正在克隆贴纸包：【${title}】\n` +
-                `📊 克隆进度：已添加 1 / ${totalCount} 个贴纸...`
-            );
-
-            const addUrl = `https://api.telegram.org/bot${TOKEN}/addStickerToSet`;
-            let lastUpdate = Date.now();
-
-            for (let i = 1; i < totalCount; i++) {
-                const item = originPack.stickers[i];
-                const itemFormat = item.is_animated ? 'animated' : (item.is_video ? 'video' : 'static');
-                
-                const stickerObj = {
-                    sticker: item.file_id,
-                    format: itemFormat,
-                    emoji_list: [item.emoji || '👍']
-                };
-
-                try {
-                    await axios.post(addUrl, {
-                        user_id: userId,
-                        name: newPackName,
-                        sticker: stickerObj
-                    });
-                } catch (addErr) {
-                    console.error('追加贴纸 ' + i + ' 失败:', addErr.response?.data?.description || addErr.message);
-                }
-
-                const currentCount = i + 1;
-                if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 1500) {
-                    try {
-                        await ctx.telegram.editMessageText(
-                            ctx.chat.id,
-                            progressMsg.message_id,
-                            null,
-                            `⏳ 正在克隆贴纸包：【${title}】\n` +
-                            `📊 克隆进度：(${totalCount} 个贴纸中已添加 ${currentCount} 个)`
-                        );
-                        lastUpdate = Date.now();
-                    } catch (e) {
-                    }
-                }
-
-                await sleep(100);
-            }
-
-            const finalLink = 'https://t.me/addstickers/' + newPackName;
-            await ctx.telegram.editMessageText(
-                ctx.chat.id,
-                progressMsg.message_id,
-                null,
-                '✅ 贴纸包克隆完成！\n\n' +
-                '📖 标题：' + title + '\n' +
-                '🔢 总计：' + totalCount + ' 个贴纸\n' +
-                '🔗 链接：\n' + finalLink
-            );
-
-        } catch (err) {
-            console.error('克隆贴纸包失败:', err.response?.data || err.message);
-            const errMsg = err.response?.data?.description || err.message || '未知错误';
-            try {
-                await ctx.telegram.editMessageText(
-                    ctx.chat.id,
-                    progressMsg.message_id,
-                    null,
-                    '❌ 克隆失败：' + errMsg
-                );
-            } catch (e) {
-                ctx.reply('❌ 克隆失败：' + errMsg);
+        const parts = line.split('#');
+        if (parts.length >= 2) {
+            const title = parts[0].trim();
+            const url = parts[1].trim();
+            if (title && url && (url.includes('addstickers') || url.includes('addemoji'))) {
+                tasks.push({ title, url });
             }
         }
+    }
+
+    if (tasks.length === 0) return;
+
+    if (tasks.length > 1) {
+        await ctx.reply(`🚀 已收到 ${tasks.length} 个表情包克隆任务，正在依次处理...`);
+    }
+
+    for (let i = 0; i < tasks.length; i++) {
+        await processSingleClone(ctx, tasks[i].title, tasks[i].url, i + 1, tasks.length);
+        await sleep(1000);
     }
 });
 
