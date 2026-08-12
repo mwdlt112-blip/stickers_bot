@@ -1,6 +1,16 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const http = require('http');
+
+// 给 Render 增加端口保活监听，防止被当作服务挂掉
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running fine!\n');
+}).listen(PORT, () => {
+    console.log(`🌐 保活 HTTP 服务已成功运行在端口 ${PORT}`);
+});
 
 const bot = new Telegraf(process.env.BOT_TOKEN, {
     handlerTimeout: 600000
@@ -28,7 +38,6 @@ bot.on('text', async (ctx) => {
 
         const originPackName = match[1];
 
-        // 发送初始进度消息，并保存消息对象以便后续原地编辑更新
         const progressMsg = await ctx.reply(
             '⏳ 已收到请求，正在准备处理...\n' +
             '📌 新标题：' + title + '\n' +
@@ -36,17 +45,14 @@ bot.on('text', async (ctx) => {
         );
 
         try {
-            // 1. 获取原贴纸包数据
             const originPack = await ctx.telegram.getStickerSet(originPackName);
             const totalCount = originPack.stickers.length;
 
-            // 2. 生成新贴纸包短名
             const botInfo = await ctx.telegram.getMe();
             const randomStr = Math.random().toString(36).substring(2, 10);
             const newPackName = 'pack_' + randomStr + '_by_' + botInfo.username;
             const userId = ctx.from.id;
 
-            // 3. 构建第一个贴纸对象并建包
             const firstItem = originPack.stickers[0];
             const firstFormat = firstItem.is_animated ? 'animated' : (firstItem.is_video ? 'video' : 'static');
             
@@ -69,7 +75,6 @@ bot.on('text', async (ctx) => {
                 throw new Error(createRes.data.description || '创建贴纸包失败');
             }
 
-            // 更新一次进度：建包成功（已添加 1 个）
             await ctx.telegram.editMessageText(
                 ctx.chat.id,
                 progressMsg.message_id,
@@ -78,7 +83,6 @@ bot.on('text', async (ctx) => {
                 `📊 克隆进度：已添加 1 / ${totalCount} 个贴纸...`
             );
 
-            // 4. 循环追加剩余贴纸，并实时刷进度
             const addUrl = `https://api.telegram.org/bot${TOKEN}/addStickerToSet`;
             let lastUpdate = Date.now();
 
@@ -102,7 +106,6 @@ bot.on('text', async (ctx) => {
                     console.error('追加贴纸 ' + i + ' 失败:', addErr.response?.data?.description || addErr.message);
                 }
 
-                // 每 5 个贴纸或每隔 1.5 秒更新一次进度（避免太频繁刷屏触发 Telegram 限制）
                 const currentCount = i + 1;
                 if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 1500) {
                     try {
@@ -115,14 +118,12 @@ bot.on('text', async (ctx) => {
                         );
                         lastUpdate = Date.now();
                     } catch (e) {
-                        // 忽略频率限制编辑错误
                     }
                 }
 
-                await sleep(100); // 保证转存速度
+                await sleep(100);
             }
 
-            // 5. 全部完成！原位修改为最终的漂亮文案
             const finalLink = 'https://t.me/addstickers/' + newPackName;
             await ctx.telegram.editMessageText(
                 ctx.chat.id,
