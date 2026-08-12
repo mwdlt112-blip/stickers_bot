@@ -2,8 +2,10 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
-// 给 Render 增加端口保活监听，防止被当作服务挂掉
+// 1. 给 Render 增加 HTTP 保活端口监听
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -12,13 +14,55 @@ http.createServer((req, res) => {
     console.log(`🌐 保活 HTTP 服务已成功运行在端口 ${PORT}`);
 });
 
-const bot = new Telegraf(process.env.BOT_TOKEN, {
-    handlerTimeout: 600000
-});
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 600000 });
 const TOKEN = process.env.BOT_TOKEN;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// 2. 用户数据持久化文件路径
+const USERS_FILE = path.join(__dirname, 'users.json');
+
+// 读取已记录的用户集合
+function getUsers() {
+    try {
+        if (fs.existsSync(USERS_FILE)) {
+            const data = fs.readFileSync(USERS_FILE, 'utf8');
+            return new Set(JSON.parse(data));
+        }
+    } catch (e) {
+        console.error('读取用户数据失败:', e.message);
+    }
+    return new Set();
+}
+
+// 保存新用户 ID
+function recordUser(userId) {
+    const users = getUsers();
+    if (!users.has(userId)) {
+        users.add(userId);
+        try {
+            fs.writeFileSync(USERS_FILE, JSON.stringify(Array.from(users)));
+        } catch (e) {
+            console.error('保存用户数据失败:', e.message);
+        }
+    }
+}
+
+// 记录所有互动的用户
+bot.use((ctx, next) => {
+    if (ctx.from && ctx.from.id) {
+        recordUser(ctx.from.id);
+    }
+    return next();
+});
+
+// 3. 指令：查看机器人用户数量统计
+bot.command('stats', async (ctx) => {
+    const users = getUsers();
+    ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${users.size} 人`);
+});
+
+// 4. 贴纸克隆主逻辑
 bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
 
@@ -129,11 +173,10 @@ bot.on('text', async (ctx) => {
                 ctx.chat.id,
                 progressMsg.message_id,
                 null,
-                '✅ **贴纸包克隆完成！**\n\n' +
+                '✅ 贴纸包克隆完成！\n\n' +
                 '📖 标题：' + title + '\n' +
                 '🔢 总计：' + totalCount + ' 个贴纸\n' +
-                '🔗 链接：\n' + finalLink,
-                { parse_mode: 'Markdown' }
+                '🔗 链接：\n' + finalLink
             );
 
         } catch (err) {
