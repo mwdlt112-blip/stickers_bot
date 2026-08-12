@@ -53,17 +53,49 @@ bot.use((ctx, next) => {
     return next();
 });
 
-// 查看累计用户统计
+// 查看累计用户统计（隐蔽管理员指令）
 bot.command('stats', async (ctx) => {
     const users = getUsers();
     ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${users.size} 人`);
 });
 
-// 3. 任务队列机制（保证多消息并发时不掉线、自动排队）
+// 3. 点击 /start 时响应包含指定粗体与斜体文本
+bot.start((ctx) => {
+    const startMessage = 
+`<b>👋 欢迎使用贴纸/表情包搬运机器人👋</b>
+
+<b>🤖 贴纸/表情包搬运机器人使用说明：</b>
+
+<b>📖 使用方法与格式：</b>
+
+<b>1. 基础单包克隆 ✅</b>
+<code>克隆#自定义表情包标题#需克隆表情包链接</code>
+<i>例如：（克隆#免费搬运机器人 @stickers_porter_bot#https://t.me/addstickers/**）</i>
+
+<b>2. 批量多包排队克隆（推荐）👍</b>
+<code>克隆#
+自定义表情包标题#需克隆表情包链接
+自定义表情包标题#需克隆表情包链接
+自定义表情包标题#需克隆表情包链接</code>
+<i>例如：（克隆#
+免费搬运机器人 @stickers_porter_bot#https://t.me/addstickers/**1
+免费搬运机器人 @stickers_porter_bot#https://t.me/addstickers/**2
+免费搬运机器人 @stickers_porter_bot#https://t.me/addstickers/**3
+）</i>
+
+<b>🔸 克隆：</b>命令前缀，触发克隆操作。
+<b>🔸 自定义表情包标题：</b>您希望克隆后新贴纸包/表情包的名称。
+<b>🔸 需克隆表情包链接：</b>原始贴纸/表情包的链接。
+
+⚠️ <i>请确保信息填写正确，以便程序顺利完成克隆。</i>`;
+
+    ctx.reply(startMessage, { parse_mode: 'HTML' });
+});
+
+// 4. 任务队列机制
 const taskQueue = [];
 let isProcessingQueue = false;
 
-// 将任务入队并触发队列消费
 function enqueueTask(task) {
     taskQueue.push(task);
     processQueue();
@@ -76,29 +108,27 @@ async function processQueue() {
     while (taskQueue.length > 0) {
         const task = taskQueue.shift();
         try {
-            await processSingleClone(task.ctx, task.title, task.packUrl, task.queueIndex, task.totalInBatch);
+            await processSingleClone(task.ctx, task.title, task.packUrl);
         } catch (err) {
             console.error('处理队列任务发生异常:', err.message);
         }
-        await sleep(1000); // 每个任务处理完后冷静 1 秒
+        await sleep(1000);
     }
 
     isProcessingQueue = false;
 }
 
 // 单个贴纸包克隆的核心逻辑函数
-async function processSingleClone(ctx, title, packUrl, taskIndex = 1, totalTasks = 1) {
+async function processSingleClone(ctx, title, packUrl) {
     const match = packUrl.match(/(?:addstickers|addemoji)\/([a-zA-Z0-9_]+)/);
     if (!match) {
         return ctx.reply(`❌ 无法识别贴纸链接：${packUrl}`);
     }
 
     const originPackName = match[1];
-    const prefix = taskQueue.length > 0 ? `[排队中] ` : '';
 
-    // 初始化/更新进度面板
     const progressMsg = await ctx.reply(
-        `⏳ ${prefix}正在克隆表情包：\n` +
+        `⏳ 正在克隆表情包：\n` +
         `📌 标题：【${title}】\n` +
         `🔢 克隆进度：【正在获取表情包信息...】`
     );
@@ -134,7 +164,6 @@ async function processSingleClone(ctx, title, packUrl, taskIndex = 1, totalTasks
             throw new Error(createRes.data.description || '创建贴纸包失败');
         }
 
-        // 更新进度：已添加第 1 个
         await ctx.telegram.editMessageText(
             ctx.chat.id,
             progressMsg.message_id,
@@ -168,7 +197,6 @@ async function processSingleClone(ctx, title, packUrl, taskIndex = 1, totalTasks
             }
 
             const currentCount = i + 1;
-            // 控制刷新频率（每 5 个贴纸或间隔 1.5 秒更新一次进度，防止 API 限流）
             if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 1500) {
                 try {
                     await ctx.telegram.editMessageText(
@@ -213,9 +241,11 @@ async function processSingleClone(ctx, title, packUrl, taskIndex = 1, totalTasks
     }
 }
 
-// 4. 监听文本消息并解析任务入队
+// 5. 监听文本消息解析任务入队
 bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
+
+    if (text.startsWith('/start')) return;
 
     const lines = text.split('\n');
     const tasksFound = [];
@@ -240,22 +270,22 @@ bot.on('text', async (ctx) => {
 
     if (tasksFound.length === 0) return;
 
-    // 将解析出的每个任务存入全局队列
     for (let i = 0; i < tasksFound.length; i++) {
         const item = tasksFound[i];
         
-        // 如果前面已有正在跑的任务，提示已加入队列
         if (isProcessingQueue || taskQueue.length > 0) {
             const queuePos = taskQueue.length + (isProcessingQueue ? 1 : 0);
-            ctx.reply(`📌 已收到请求【${item.title}】，当前已有任务在处理，已为你放入队列（排队第 ${queuePos} 位）...`);
+            ctx.reply(
+                `✅ 已收到请求\n\n` +
+                `📌新标题：【${item.title}】\n` +
+                `⌛️状态：【当前已有任务在处理，已为你放入队列（排队第 ${queuePos} 位）...】`
+            );
         }
 
         enqueueTask({
             ctx: ctx,
             title: item.title,
-            packUrl: item.url,
-            queueIndex: i + 1,
-            totalInBatch: tasksFound.length
+            packUrl: item.url
         });
     }
 });
