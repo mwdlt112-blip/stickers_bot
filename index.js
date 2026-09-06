@@ -4,6 +4,14 @@ const { Redis } = require('@upstash/redis');
 const axios = require('axios');
 const http = require('http');
 
+// 0. 全局防崩溃守护（无论发生任何底层网络错误，绝不退出进程）
+process.on('uncaughtException', (err) => {
+    console.error('🛡 拦截到全局未捕获异常:', err.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('🛡 拦截到全局 Promise 拒绝:', reason?.message || reason);
+});
+
 // 1. 给 Render 增加 HTTP 保活端口监听
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
@@ -16,6 +24,11 @@ http.createServer((req, res) => {
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 1200000 });
 const TOKEN = process.env.BOT_TOKEN;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Telegraf 内部错误捕获，防止网络断流退出
+bot.catch((err, ctx) => {
+    console.error(`🛡 拦截到 Telegraf 异常:`, err.message || err);
+});
 
 // 2. 初始化云端 Redis（持久化存储用户）
 let redis = null;
@@ -54,8 +67,10 @@ bot.use(async (ctx, next) => {
 
 // 查看累计用户统计
 bot.command('stats', async (ctx) => {
-    const totalCount = await getUserCount();
-    ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${totalCount} 人\n⚡️ 当前并发槽位：${activeWorkers}/${MAX_CONCURRENT_TASKS}\n⏳ 队列等待数：${taskQueue.length}`);
+    try {
+        const totalCount = await getUserCount();
+        ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${totalCount} 人\n⚡️ 当前并发槽位：${activeWorkers}/${MAX_CONCURRENT_TASKS}\n⏳ 队列等待数：${taskQueue.length}`);
+    } catch (e) {}
 });
 
 // 3. 点击 /start 时响应说明
@@ -86,13 +101,13 @@ bot.start((ctx) => {
 <b>🔸 自定义表情包标题：</b>您希望克隆后新贴纸包/表情包的名称。
 <b>🔸 需克隆表情包链接：</b>原始贴纸/表情包的链接。
 
-⚡️ <i>系统内置防限流自动等待引擎，长表情包与高并发任务将稳定克隆完毕！</i>`;
+⚡️ <i>系统内置防崩溃保护与自动排队引擎，多包任务稳定运行！</i>`;
 
-    ctx.reply(startMessage, { parse_mode: 'HTML' });
+    ctx.reply(startMessage, { parse_mode: 'HTML' }).catch(() => {});
 });
 
 // 4. 并发工作池队列机制
-const MAX_CONCURRENT_TASKS = 2; // 调整为 2 保证单个长表情包有足够 API 吞吐配额，不易撞墙
+const MAX_CONCURRENT_TASKS = 2; // 保持 2 个并发，给 Telegram 留够速率余量
 const taskQueue = [];
 let activeWorkers = 0;
 
@@ -108,7 +123,7 @@ function checkAndProcessNext() {
         
         processSingleClone(nextTask.ctx, nextTask.title, nextTask.packUrl)
             .catch(err => {
-                console.error('任务执行异常:', err.message);
+                console.error('任务处理出错:', err.message);
             })
             .finally(() => {
                 activeWorkers--;
@@ -123,16 +138,15 @@ async function safeAddSticker(addUrl, payload, retryCount = 0) {
         await axios.post(addUrl, payload);
     } catch (err) {
         const resData = err.response?.data;
-        // 如果触发了 Telegram 速率限制 (Flood control / 429)
         if (resData && resData.error_code === 429) {
-            const retryAfter = (resData.parameters?.retry_after || 3) + 1;
-            console.log(`⏳ 触发 Telegram 频率限制，自动等待 ${retryAfter} 秒后继续...`);
+            const retryAfter = (resData.parameters?.retry_after || 4) + 1;
+            console.log(`⏳ 触发频率限制，自动等待 ${retryAfter} 秒...`);
             await sleep(retryAfter * 1000);
             if (retryCount < 5) {
                 return safeAddSticker(addUrl, payload, retryCount + 1);
             }
         }
-        console.error('追加贴纸单项失败:', resData?.description || err.message);
+        console.error('追加贴纸单项跳过:', resData?.description || err.message);
     }
 }
 
@@ -140,23 +154,26 @@ async function safeAddSticker(addUrl, payload, retryCount = 0) {
 async function processSingleClone(ctx, title, packUrl) {
     const match = packUrl.match(/(?:addstickers|addemoji)\/([a-zA-Z0-9_]+)/);
     if (!match) {
-        return ctx.reply(`❌ 无法识别贴纸链接：${packUrl}`);
+        return ctx.reply(`❌ 无法识别贴纸链接：${packUrl}`).catch(() => {});
     }
 
     const originPackName = match[1];
 
-    const progressMsg = await ctx.reply(
-        `⏳ 正在克隆表情包：\n` +
-        `📌 标题：【${title}】\n` +
-        `🔢 克隆进度：【正在获取表情包信息...】`
-    );
+    let progressMsg = null;
+    try {
+        progressMsg = await ctx.reply(
+            `⏳ 正在克隆表情包：\n` +
+            `📌 标题：【${title}】\n` +
+            `🔢 克隆进度：【正在获取表情包信息...】`
+        );
+    } catch (e) {}
 
     try {
         const originPack = await ctx.telegram.getStickerSet(originPackName);
         const totalCount = originPack.stickers.length;
 
         if (totalCount === 0) {
-            return ctx.reply(`❌ 该表情包内没有检测到贴纸。`);
+            return ctx.reply(`❌ 该表情包内没有检测到贴纸。`).catch(() => {});
         }
 
         const botInfo = await ctx.telegram.getMe();
@@ -186,14 +203,16 @@ async function processSingleClone(ctx, title, packUrl) {
             throw new Error(createRes.data.description || '创建贴纸包失败');
         }
 
-        await ctx.telegram.editMessageText(
-            ctx.chat.id,
-            progressMsg.message_id,
-            null,
-            `⏳ 正在克隆表情包：\n` +
-            `📌 标题：【${title}】\n` +
-            `🔢 克隆进度：【已添加第 1/${totalCount} 个贴纸】`
-        );
+        if (progressMsg) {
+            ctx.telegram.editMessageText(
+                ctx.chat.id,
+                progressMsg.message_id,
+                null,
+                `⏳ 正在克隆表情包：\n` +
+                `📌 标题：【${title}】\n` +
+                `🔢 克隆进度：【已添加第 1/${totalCount} 个贴纸】`
+            ).catch(() => {});
+        }
 
         const addUrl = `https://api.telegram.org/bot${TOKEN}/addStickerToSet`;
         let lastUpdate = Date.now();
@@ -208,7 +227,6 @@ async function processSingleClone(ctx, title, packUrl) {
                 emoji_list: [item.emoji || '👍']
             };
 
-            // 使用安全重试机制提交贴纸
             await safeAddSticker(addUrl, {
                 user_id: userId,
                 name: newPackName,
@@ -216,102 +234,108 @@ async function processSingleClone(ctx, title, packUrl) {
             });
 
             const currentCount = i + 1;
-            // 降低编辑消息的频率（至少间隔 3 秒），防止编辑进度消息本身被 Telegram 限流
-            if (currentCount % 10 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 3000) {
-                try {
-                    await ctx.telegram.editMessageText(
-                        ctx.chat.id,
-                        progressMsg.message_id,
-                        null,
-                        `⏳ 正在克隆表情包：\n` +
-                        `📌 标题：【${title}】\n` +
-                        `🔢 克隆进度：【已添加第 ${currentCount}/${totalCount} 个贴纸】`
-                    );
-                    lastUpdate = Date.now();
-                } catch (e) {}
+            if (progressMsg && (currentCount % 10 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 3500)) {
+                ctx.telegram.editMessageText(
+                    ctx.chat.id,
+                    progressMsg.message_id,
+                    null,
+                    `⏳ 正在克隆表情包：\n` +
+                    `📌 标题：【${title}】\n` +
+                    `🔢 克隆进度：【已添加第 ${currentCount}/${totalCount} 个贴纸】`
+                ).catch(() => {});
+                lastUpdate = Date.now();
             }
 
-            await sleep(350); // 安全间距：Emoji 包大容量时 Telegram 限制更严，350ms 最稳定
+            await sleep(350);
         }
 
         const finalLink = (originPack.sticker_type === 'custom_emoji' ? 'https://t.me/addemoji/' : 'https://t.me/addstickers/') + newPackName;
-        await ctx.telegram.editMessageText(
-            ctx.chat.id,
-            progressMsg.message_id,
-            null,
-            `✅ 表情包克隆完成！\n\n` +
-            `📌 标题：【${title}】\n` +
-            `🔢 总计：共 ${totalCount} 个贴纸\n` +
-            `🔗 链接：\n${finalLink}`
-        );
+        if (progressMsg) {
+            ctx.telegram.editMessageText(
+                ctx.chat.id,
+                progressMsg.message_id,
+                null,
+                `✅ 表情包克隆完成！\n\n` +
+                `📌 标题：【${title}】\n` +
+                `🔢 总计：共 ${totalCount} 个贴纸\n` +
+                `🔗 链接：\n${finalLink}`
+            ).catch(() => {
+                ctx.reply(`✅ 表情包克隆完成！\n\n📌 标题：【${title}】\n🔗 链接：\n${finalLink}`).catch(() => {});
+            });
+        }
 
     } catch (err) {
-        console.error('克隆失败:', err.response?.data || err.message);
+        console.error('克隆单包失败:', err.response?.data || err.message);
         const errMsg = err.response?.data?.description || err.message || '未知错误';
-        try {
-            await ctx.telegram.editMessageText(
+        if (progressMsg) {
+            ctx.telegram.editMessageText(
                 ctx.chat.id,
                 progressMsg.message_id,
                 null,
                 `❌ 克隆失败：${errMsg}`
-            );
-        } catch (e) {
-            ctx.reply(`❌ 克隆失败：${errMsg}`);
+            ).catch(() => {
+                ctx.reply(`❌ 克隆失败：${errMsg}`).catch(() => {});
+            });
         }
     }
 }
 
 // 5. 监听文本消息解析任务入队
 bot.on('text', async (ctx) => {
-    const text = ctx.message.text.trim();
+    try {
+        const text = ctx.message.text.trim();
+        if (text.startsWith('/start') || text.startsWith('/stats')) return;
 
-    if (text.startsWith('/start') || text.startsWith('/stats')) return;
+        const lines = text.split('\n');
+        const tasksFound = [];
 
-    const lines = text.split('\n');
-    const tasksFound = [];
+        for (let line of lines) {
+            line = line.trim();
+            if (!line) continue;
 
-    for (let line of lines) {
-        line = line.trim();
-        if (!line) continue;
+            if (line.startsWith('克隆#')) {
+                line = line.replace('克隆#', '');
+            }
 
-        if (line.startsWith('克隆#')) {
-            line = line.replace('克隆#', '');
-        }
-
-        const parts = line.split('#');
-        if (parts.length >= 2) {
-            const title = parts[0].trim();
-            const url = parts[1].trim();
-            if (title && url && (url.includes('addstickers') || url.includes('addemoji'))) {
-                tasksFound.push({ title, url });
+            const parts = line.split('#');
+            if (parts.length >= 2) {
+                const title = parts[0].trim();
+                const url = parts[1].trim();
+                if (title && url && (url.includes('addstickers') || url.includes('addemoji'))) {
+                    tasksFound.push({ title, url });
+                }
             }
         }
-    }
 
-    if (tasksFound.length === 0) return;
+        if (tasksFound.length === 0) return;
 
-    for (let i = 0; i < tasksFound.length; i++) {
-        const item = tasksFound[i];
-        
-        if (activeWorkers >= MAX_CONCURRENT_TASKS) {
-            const queuePos = taskQueue.length + 1;
-            ctx.reply(
-                `✅ 已收到请求\n\n` +
-                `📌 新标题：【${item.title}】\n` +
-                `⌛️ 状态：【已有任务正在处理，已为您放入队列（排在第 ${queuePos} 位）...】`
-            );
+        for (let i = 0; i < tasksFound.length; i++) {
+            const item = tasksFound[i];
+            
+            if (activeWorkers >= MAX_CONCURRENT_TASKS) {
+                const queuePos = taskQueue.length + 1;
+                ctx.reply(
+                    `✅ 已收到请求\n\n` +
+                    `📌 新标题：【${item.title}】\n` +
+                    `⌛️ 状态：【已有任务正在处理，已为您放入队列（排在第 ${queuePos} 位）...】`
+                ).catch(() => {});
+            }
+
+            enqueueTask({
+                ctx: ctx,
+                title: item.title,
+                packUrl: item.url
+            });
         }
-
-        enqueueTask({
-            ctx: ctx,
-            title: item.title,
-            packUrl: item.url
-        });
+    } catch (err) {
+        console.error('文本消息处理异常:', err.message);
     }
 });
 
 bot.launch().then(() => {
-    console.log('🤖 贴纸防限流机器人已成功上线开机！');
+    console.log('🤖 贴纸防崩溃并发机器人已成功上线开机！');
+}).catch(err => {
+    console.error('启动失败:', err.message);
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
