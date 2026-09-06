@@ -1,9 +1,8 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
+const { Redis } = require('@upstash/redis');
 const axios = require('axios');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 
 // 1. 给 Render 增加 HTTP 保活端口监听
 const PORT = process.env.PORT || 3000;
@@ -16,37 +15,39 @@ http.createServer((req, res) => {
 
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 600000 });
 const TOKEN = process.env.BOT_TOKEN;
-
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// 2. 用户数据持久化文件路径
-const USERS_FILE = path.join(__dirname, 'users.json');
+// 2. 初始化云端 Redis（持久化存储用户）
+let redis = null;
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    redis = new Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+}
 
-function getUsers() {
+// 记录用户 ID 至云端集合（Set 结构自动去重）
+async function recordUser(userId) {
+    if (!redis) return;
     try {
-        if (fs.existsSync(USERS_FILE)) {
-            const data = fs.readFileSync(USERS_FILE, 'utf8');
-            return new Set(JSON.parse(data));
-        }
+        await redis.sadd('bot_users', userId.toString());
+    } catch (e) {
+        console.error('云端写入用户失败:', e.message);
+    }
+}
+
+// 获取累计用户总数
+async function getUserCount() {
+    if (!redis) return 0;
+    try {
+        return await redis.scard('bot_users');
     } catch (e) {
         console.error('读取用户数据失败:', e.message);
-    }
-    return new Set();
-}
-
-function recordUser(userId) {
-    const users = getUsers();
-    if (!users.has(userId)) {
-        users.add(userId);
-        try {
-            fs.writeFileSync(USERS_FILE, JSON.stringify(Array.from(users)));
-        } catch (e) {
-            console.error('保存用户数据失败:', e.message);
-        }
+        return 0;
     }
 }
 
-bot.use((ctx, next) => {
+bot.use(async (ctx, next) => {
     if (ctx.from && ctx.from.id) {
         recordUser(ctx.from.id);
     }
@@ -55,11 +56,11 @@ bot.use((ctx, next) => {
 
 // 查看累计用户统计（隐蔽管理员指令）
 bot.command('stats', async (ctx) => {
-    const users = getUsers();
-    ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${users.size} 人`);
+    const totalCount = await getUserCount();
+    ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${totalCount} 人\n⚡️ 当前并发槽位：${activeWorkers}/${MAX_CONCURRENT_TASKS}\n⏳ 队列等待数：${taskQueue.length}`);
 });
 
-// 3. 点击 /start 时响应包含指定粗体与斜体文本
+// 3. 点击 /start 时响应说明
 bot.start((ctx) => {
     const startMessage = 
 `<b>👋 欢迎使用贴纸/表情包搬运机器人👋</b>
@@ -87,35 +88,36 @@ bot.start((ctx) => {
 <b>🔸 自定义表情包标题：</b>您希望克隆后新贴纸包/表情包的名称。
 <b>🔸 需克隆表情包链接：</b>原始贴纸/表情包的链接。
 
-⚠️ <i>请确保信息填写正确，以便程序顺利完成克隆。</i>`;
+⚡️ <i>系统已升级多通道并发引擎，多包任务将并行极速处理！</i>`;
 
     ctx.reply(startMessage, { parse_mode: 'HTML' });
 });
 
-// 4. 任务队列机制
+// 4. 并发工作池队列机制（支持多个表情包同时克隆）
+const MAX_CONCURRENT_TASKS = 3; // 同时并发克隆的表情包数量（推荐 3~5，兼顾速度与不被 Telegram 限流）
 const taskQueue = [];
-let isProcessingQueue = false;
+let activeWorkers = 0;
 
 function enqueueTask(task) {
     taskQueue.push(task);
-    processQueue();
+    checkAndProcessNext();
 }
 
-async function processQueue() {
-    if (isProcessingQueue) return;
-    isProcessingQueue = true;
-
-    while (taskQueue.length > 0) {
-        const task = taskQueue.shift();
-        try {
-            await processSingleClone(task.ctx, task.title, task.packUrl);
-        } catch (err) {
-            console.error('处理队列任务发生异常:', err.message);
-        }
-        await sleep(1000);
+function checkAndProcessNext() {
+    // 只要有空闲的工作槽位，且队列中还有任务，就启动新的并发任务
+    while (activeWorkers < MAX_CONCURRENT_TASKS && taskQueue.length > 0) {
+        const nextTask = taskQueue.shift();
+        activeWorkers++;
+        
+        processSingleClone(nextTask.ctx, nextTask.title, nextTask.packUrl)
+            .catch(err => {
+                console.error('任务执行异常:', err.message);
+            })
+            .finally(() => {
+                activeWorkers--;
+                checkAndProcessNext(); // 该任务完成，释放通道并处理下一个
+            });
     }
-
-    isProcessingQueue = false;
 }
 
 // 单个贴纸包克隆的核心逻辑函数
@@ -197,7 +199,8 @@ async function processSingleClone(ctx, title, packUrl) {
             }
 
             const currentCount = i + 1;
-            if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 1500) {
+            // 控制刷新频率，降低 Telegram API 负载
+            if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 2000) {
                 try {
                     await ctx.telegram.editMessageText(
                         ctx.chat.id,
@@ -211,7 +214,7 @@ async function processSingleClone(ctx, title, packUrl) {
                 } catch (e) {}
             }
 
-            await sleep(100);
+            await sleep(150); // 微延迟防止并发多任务时触发 Telegram 429 限流
         }
 
         const finalLink = 'https://t.me/addstickers/' + newPackName;
@@ -273,12 +276,13 @@ bot.on('text', async (ctx) => {
     for (let i = 0; i < tasksFound.length; i++) {
         const item = tasksFound[i];
         
-        if (isProcessingQueue || taskQueue.length > 0) {
-            const queuePos = taskQueue.length + (isProcessingQueue ? 1 : 0);
+        // 如果当前工作通道已满，提示排队
+        if (activeWorkers >= MAX_CONCURRENT_TASKS) {
+            const queuePos = taskQueue.length + 1;
             ctx.reply(
                 `✅ 已收到请求\n\n` +
-                `📌新标题：【${item.title}】\n` +
-                `⌛️状态：【当前已有任务在处理，已为你放入队列（排队第 ${queuePos} 位）...】`
+                `📌 新标题：【${item.title}】\n` +
+                `⌛️ 状态：【已有 ${MAX_CONCURRENT_TASKS} 个任务正在全力处理，当前已放入队列（排在第 ${queuePos} 位）...】`
             );
         }
 
@@ -291,7 +295,7 @@ bot.on('text', async (ctx) => {
 });
 
 bot.launch().then(() => {
-    console.log('🤖 机器人已成功上线开机！');
+    console.log('🤖 贴纸并发机器人已成功上线开机！');
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
