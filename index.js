@@ -13,7 +13,7 @@ http.createServer((req, res) => {
     console.log(`🌐 保活 HTTP 服务已成功运行在端口 ${PORT}`);
 });
 
-const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 600000 });
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 1200000 });
 const TOKEN = process.env.BOT_TOKEN;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -26,7 +26,6 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
     });
 }
 
-// 记录用户 ID 至云端集合（Set 结构自动去重）
 async function recordUser(userId) {
     if (!redis) return;
     try {
@@ -36,7 +35,6 @@ async function recordUser(userId) {
     }
 }
 
-// 获取累计用户总数
 async function getUserCount() {
     if (!redis) return 0;
     try {
@@ -54,7 +52,7 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-// 查看累计用户统计（隐蔽管理员指令）
+// 查看累计用户统计
 bot.command('stats', async (ctx) => {
     const totalCount = await getUserCount();
     ctx.reply(`📊 机器人运行数据统计\n\n👥 当前累计使用用户总数：${totalCount} 人\n⚡️ 当前并发槽位：${activeWorkers}/${MAX_CONCURRENT_TASKS}\n⏳ 队列等待数：${taskQueue.length}`);
@@ -88,13 +86,13 @@ bot.start((ctx) => {
 <b>🔸 自定义表情包标题：</b>您希望克隆后新贴纸包/表情包的名称。
 <b>🔸 需克隆表情包链接：</b>原始贴纸/表情包的链接。
 
-⚡️ <i>系统已升级多通道并发引擎，多包任务将并行极速处理！</i>`;
+⚡️ <i>系统内置防限流自动等待引擎，长表情包与高并发任务将稳定克隆完毕！</i>`;
 
     ctx.reply(startMessage, { parse_mode: 'HTML' });
 });
 
-// 4. 并发工作池队列机制（支持多个表情包同时克隆）
-const MAX_CONCURRENT_TASKS = 3; // 同时并发克隆的表情包数量（推荐 3~5，兼顾速度与不被 Telegram 限流）
+// 4. 并发工作池队列机制
+const MAX_CONCURRENT_TASKS = 2; // 调整为 2 保证单个长表情包有足够 API 吞吐配额，不易撞墙
 const taskQueue = [];
 let activeWorkers = 0;
 
@@ -104,7 +102,6 @@ function enqueueTask(task) {
 }
 
 function checkAndProcessNext() {
-    // 只要有空闲的工作槽位，且队列中还有任务，就启动新的并发任务
     while (activeWorkers < MAX_CONCURRENT_TASKS && taskQueue.length > 0) {
         const nextTask = taskQueue.shift();
         activeWorkers++;
@@ -115,8 +112,27 @@ function checkAndProcessNext() {
             })
             .finally(() => {
                 activeWorkers--;
-                checkAndProcessNext(); // 该任务完成，释放通道并处理下一个
+                checkAndProcessNext();
             });
+    }
+}
+
+// 带有 Telegram 429 自动等待重试的安全请求函数
+async function safeAddSticker(addUrl, payload, retryCount = 0) {
+    try {
+        await axios.post(addUrl, payload);
+    } catch (err) {
+        const resData = err.response?.data;
+        // 如果触发了 Telegram 速率限制 (Flood control / 429)
+        if (resData && resData.error_code === 429) {
+            const retryAfter = (resData.parameters?.retry_after || 3) + 1;
+            console.log(`⏳ 触发 Telegram 频率限制，自动等待 ${retryAfter} 秒后继续...`);
+            await sleep(retryAfter * 1000);
+            if (retryCount < 5) {
+                return safeAddSticker(addUrl, payload, retryCount + 1);
+            }
+        }
+        console.error('追加贴纸单项失败:', resData?.description || err.message);
     }
 }
 
@@ -138,6 +154,10 @@ async function processSingleClone(ctx, title, packUrl) {
     try {
         const originPack = await ctx.telegram.getStickerSet(originPackName);
         const totalCount = originPack.stickers.length;
+
+        if (totalCount === 0) {
+            return ctx.reply(`❌ 该表情包内没有检测到贴纸。`);
+        }
 
         const botInfo = await ctx.telegram.getMe();
         const randomStr = Math.random().toString(36).substring(2, 10);
@@ -188,19 +208,16 @@ async function processSingleClone(ctx, title, packUrl) {
                 emoji_list: [item.emoji || '👍']
             };
 
-            try {
-                await axios.post(addUrl, {
-                    user_id: userId,
-                    name: newPackName,
-                    sticker: stickerObj
-                });
-            } catch (addErr) {
-                console.error(`追加贴纸 ${i} 失败:`, addErr.response?.data?.description || addErr.message);
-            }
+            // 使用安全重试机制提交贴纸
+            await safeAddSticker(addUrl, {
+                user_id: userId,
+                name: newPackName,
+                sticker: stickerObj
+            });
 
             const currentCount = i + 1;
-            // 控制刷新频率，降低 Telegram API 负载
-            if (currentCount % 5 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 2000) {
+            // 降低编辑消息的频率（至少间隔 3 秒），防止编辑进度消息本身被 Telegram 限流
+            if (currentCount % 10 === 0 || currentCount === totalCount || Date.now() - lastUpdate > 3000) {
                 try {
                     await ctx.telegram.editMessageText(
                         ctx.chat.id,
@@ -214,10 +231,10 @@ async function processSingleClone(ctx, title, packUrl) {
                 } catch (e) {}
             }
 
-            await sleep(150); // 微延迟防止并发多任务时触发 Telegram 429 限流
+            await sleep(350); // 安全间距：Emoji 包大容量时 Telegram 限制更严，350ms 最稳定
         }
 
-        const finalLink = 'https://t.me/addstickers/' + newPackName;
+        const finalLink = (originPack.sticker_type === 'custom_emoji' ? 'https://t.me/addemoji/' : 'https://t.me/addstickers/') + newPackName;
         await ctx.telegram.editMessageText(
             ctx.chat.id,
             progressMsg.message_id,
@@ -248,7 +265,7 @@ async function processSingleClone(ctx, title, packUrl) {
 bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
 
-    if (text.startsWith('/start')) return;
+    if (text.startsWith('/start') || text.startsWith('/stats')) return;
 
     const lines = text.split('\n');
     const tasksFound = [];
@@ -276,13 +293,12 @@ bot.on('text', async (ctx) => {
     for (let i = 0; i < tasksFound.length; i++) {
         const item = tasksFound[i];
         
-        // 如果当前工作通道已满，提示排队
         if (activeWorkers >= MAX_CONCURRENT_TASKS) {
             const queuePos = taskQueue.length + 1;
             ctx.reply(
                 `✅ 已收到请求\n\n` +
                 `📌 新标题：【${item.title}】\n` +
-                `⌛️ 状态：【已有 ${MAX_CONCURRENT_TASKS} 个任务正在全力处理，当前已放入队列（排在第 ${queuePos} 位）...】`
+                `⌛️ 状态：【已有任务正在处理，已为您放入队列（排在第 ${queuePos} 位）...】`
             );
         }
 
@@ -295,7 +311,7 @@ bot.on('text', async (ctx) => {
 });
 
 bot.launch().then(() => {
-    console.log('🤖 贴纸并发机器人已成功上线开机！');
+    console.log('🤖 贴纸防限流机器人已成功上线开机！');
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
